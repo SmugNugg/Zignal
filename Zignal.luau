@@ -49,7 +49,6 @@
 ----------------------------------------------------------------
 -- TYPES
 ----------------------------------------------------------------
-
 export type Connection<T...> = {
 	Connected: boolean,
 	Disconnect: (self: Connection<T...>) -> (),
@@ -69,14 +68,11 @@ export type Signal<T...> = {
 	Fire: (self: Signal<T...>, T...) -> (),
 	Wait: (self: Signal<T...>) -> T...,
 	Destroy: (self: Signal<T...>) -> (),
-
 	Pause: (self: Signal<T...>) -> (),
 	Resume: (self: Signal<T...>) -> (),
-
 	IsDestroyed: (self: Signal<T...>) -> boolean,
 	IsPaused: (self: Signal<T...>) -> boolean,
 	GetConnectionCount: (self: Signal<T...>) -> number,
-
 	__index: Signal<T...>,
 	__tostring: (self: Signal<T...>) -> string,
 
@@ -95,7 +91,6 @@ export type Signal<T...> = {
 ----------------------------------------------------------------
 -- CONSTANTS
 ----------------------------------------------------------------
-
 local DEFAULT_PRIORITY = 0
 local POOL_LIMIT = 512
 local MAX_WAITERS = 512
@@ -103,8 +98,8 @@ local MAX_WAITERS = 512
 ----------------------------------------------------------------
 -- CONNECTION POOL
 ----------------------------------------------------------------
-
 local ConnectionPool: { Connection<any> } = {}
+local poolSize = 0
 
 local function resetConnection(conn: Connection<any>)
 	conn.Connected = false
@@ -116,9 +111,8 @@ local function resetConnection(conn: Connection<any>)
 end
 
 ----------------------------------------------------------------
--- SHARED CONNECTION METHODS
+-- CONNECTION METHODS
 ----------------------------------------------------------------
-
 local function connectionDisconnect<T...>(self: Connection<T...>)
 	if not self.Connected then return end
 	self.Connected = false
@@ -127,45 +121,32 @@ local function connectionDisconnect<T...>(self: Connection<T...>)
 	if not sig then return end
 
 	if sig._firing then
-		local d = sig._deferred
-		if not d then
-			d = {}
-			sig._deferred = d
-		end
-		table.insert(d, self)
+		sig._deferred = sig._deferred or {}
+		table.insert(sig._deferred, self)
 		return
 	end
 
 	local prev = self._prev
 	local next = self._next
-	if prev then
-		prev._next = next
-	else
-		sig._head = next
-	end
-	if next then
-		next._prev = prev
-	else
-		sig._tail = prev
-	end
+	if prev then prev._next = next else sig._head = next end
+	if next then next._prev = prev else sig._tail = prev end
 	sig._count -= 1
 
 	self._signal = nil
 	self._fn = nil
 	resetConnection(self)
-	if #ConnectionPool < POOL_LIMIT then
-		table.insert(ConnectionPool, self)
+	if poolSize < POOL_LIMIT then
+		poolSize += 1
+		ConnectionPool[poolSize] = self
 	end
 end
 
 local function connectionReconnect<T...>(self: Connection<T...>): boolean
 	if self.Connected or not self._fn then return false end
-
 	local sig = self._signal
 	if not sig or sig._destroyed then return false end
 
 	self.Connected = true
-
 	local prio = self._priority
 	local head = sig._head
 	local tail = sig._tail
@@ -200,11 +181,7 @@ local function connectionReconnect<T...>(self: Connection<T...>): boolean
 	if cur then
 		self._next = cur
 		self._prev = cur._prev
-		if cur._prev then
-			cur._prev._next = self
-		else
-			sig._head = self
-		end
+		if cur._prev then cur._prev._next = self else sig._head = self end
 		cur._prev = self
 	else
 		self._prev = tail
@@ -216,36 +193,8 @@ local function connectionReconnect<T...>(self: Connection<T...>): boolean
 end
 
 ----------------------------------------------------------------
--- CONNECTION ACQUISITION
-----------------------------------------------------------------
-
-local function acquireConnection<T...>(
-	signal: Signal<T...>,
-	fn: (T...) -> (),
-	priority: number
-): Connection<T...>
-	local conn: Connection<T...> = table.remove(ConnectionPool)
-	if not conn then
-		conn = {} :: any
-	end
-
-	conn.Connected = true
-	conn._signal = signal
-	conn._fn = fn
-	conn._priority = priority
-	conn._next = nil
-	conn._prev = nil
-
-	conn.Disconnect = connectionDisconnect :: any
-	conn.Reconnect = connectionReconnect :: any
-
-	return conn
-end
-
-----------------------------------------------------------------
 -- SIGNAL CLASS
 ----------------------------------------------------------------
-
 local Signal = {}
 Signal.__index = Signal
 
@@ -253,10 +202,6 @@ function Signal.__tostring(self)
 	if self._destroyed then return "Signal<destroyed>" end
 	return `Signal<{self._name or "unnamed"} count={self._count}>`
 end
-
-----------------------------------------------------------------
--- CONSTRUCTOR
-----------------------------------------------------------------
 
 function Signal.new<T...>(name: string?): Signal<T...>
 	local self: Signal<T...> = setmetatable({}, Signal) :: Signal<T...>
@@ -274,32 +219,30 @@ function Signal.new<T...>(name: string?): Signal<T...>
 end
 
 ----------------------------------------------------------------
--- WRAP CONSTRUCTOR
+-- CONNECT / ONCE
 ----------------------------------------------------------------
-
-function Signal.Wrap<T...>(rbxScriptSignal: RBXScriptSignal, name: string?): Signal<T...>
-	local self = Signal.new(name) :: Signal<T...>
-	local function forwarder(...: T...)
-		self:Fire(...)
-	end
-	self._nativeConn = rbxScriptSignal:Connect(forwarder)
-	return self
-end
-
-----------------------------------------------------------------
--- CONNECT
-----------------------------------------------------------------
-
 function Signal:Connect<T...>(fn: (T...) -> (), priority: number?): Connection<T...>
-	if typeof(fn) ~= "function" then
-		error("Signal:Connect expects function", 2)
-	end
-	if self._destroyed then
-		error("Signal:Connect on destroyed signal", 2)
-	end
+	if typeof(fn) ~= "function" then error("Signal:Connect expects function", 2) end
+	if self._destroyed then error("Signal:Connect on destroyed signal", 2) end
 
 	local prio = priority or DEFAULT_PRIORITY
-	local conn = acquireConnection(self, fn, prio)
+	local conn: Connection<T...>
+	if poolSize > 0 then
+		conn = ConnectionPool[poolSize]
+		ConnectionPool[poolSize] = nil
+		poolSize -= 1
+	else
+		conn = {} :: any
+	end
+
+	conn.Connected = true
+	conn._signal = self
+	conn._fn = fn
+	conn._priority = prio
+	conn._next = nil
+	conn._prev = nil
+	conn.Disconnect = connectionDisconnect :: any
+	conn.Reconnect = connectionReconnect :: any
 
 	local head = self._head
 	local tail = self._tail
@@ -342,11 +285,7 @@ function Signal:Connect<T...>(fn: (T...) -> (), priority: number?): Connection<T
 	if cur then
 		conn._next = cur
 		conn._prev = cur._prev
-		if cur._prev then
-			cur._prev._next = conn
-		else
-			self._head = conn
-		end
+		if cur._prev then cur._prev._next = conn else self._head = conn end
 		cur._prev = conn
 	else
 		conn._prev = tail
@@ -354,149 +293,83 @@ function Signal:Connect<T...>(fn: (T...) -> (), priority: number?): Connection<T
 		self._tail = conn
 	end
 	self._count += 1
-
 	return conn
 end
 
-----------------------------------------------------------------
--- ONCE
-----------------------------------------------------------------
-
 function Signal:Once<T...>(fn: (T...) -> (), priority: number?): Connection<T...>
-	local function dummy() end
+	local dummy = function() end
 	local conn = self:Connect(dummy, priority)
-	local wrapper = function(...: T...)
+	conn._fn = function(...)
 		conn:Disconnect()
 		fn(...)
 	end
-	conn._fn = wrapper
 	return conn
 end
 
 ----------------------------------------------------------------
 -- FIRE
 ----------------------------------------------------------------
-
 function Signal:Fire<T...>(...: T...)
 	if self._destroyed or self._paused or self._count == 0 then return end
 
 	self._firing = true
-
 	local deferred = self._deferred
 	self._deferred = nil
-	if deferred then
-		table.clear(deferred)
-	end
+	if deferred then table.clear(deferred) end
 
 	local cur = self._head
 	while cur do
-		if cur.Connected then
-			local fn = cur._fn
-			if fn then
-				fn(...)
-			end
-		end
+		if cur.Connected and cur._fn then cur._fn(...) end
 		cur = cur._next
 	end
 
 	self._firing = false
-
 	if deferred then
-		for _, c in ipairs(deferred) do
-			if c.Connected then
-				c:Disconnect()
-			end
-		end
+		for _, c in ipairs(deferred) do if c.Connected then c:Disconnect() end end
 	end
 
 	if self._waiters then
 		local waiters = self._waiters
 		self._waiters = nil
-		for i = 1, #waiters do
-			task.spawn(waiters[i], ...)
-		end
+		for i = 1, #waiters do task.spawn(waiters[i], ...) end
 	end
 end
 
 ----------------------------------------------------------------
--- WAIT
+-- WAIT, PAUSE, RESUME, DESTROY
 ----------------------------------------------------------------
-
 function Signal:Wait<T...>(): T...
-	if self._destroyed then
-		error("Signal:Wait on destroyed signal", 2)
-	end
-
+	if self._destroyed then error("Signal:Wait on destroyed signal", 2) end
 	local thread = coroutine.running()
-	if not thread then
-		error("Wait must be in coroutine", 2)
-	end
+	if not thread then error("Wait must be in coroutine", 2) end
 
 	self._waiters = self._waiters or {}
-	if #self._waiters >= MAX_WAITERS then
-		error("Too many waiters", 2)
-	end
+	if #self._waiters >= MAX_WAITERS then error("Too many waiters", 2) end
 	table.insert(self._waiters, thread)
-
 	return coroutine.yield()
 end
 
-----------------------------------------------------------------
--- PAUSE / RESUME
-----------------------------------------------------------------
-
-function Signal:Pause()
-	if not self._destroyed then self._paused = true end
-end
-
-function Signal:Resume()
-	if not self._destroyed then self._paused = false end
-end
-
-----------------------------------------------------------------
--- STATUS QUERIES
-----------------------------------------------------------------
-
-function Signal:IsDestroyed(): boolean
-	return self._destroyed or false
-end
-
-function Signal:IsPaused(): boolean
-	return (not self._destroyed) and self._paused or false
-end
-
-function Signal:GetConnectionCount(): number
-	return (not self._destroyed) and self._count or 0
-end
-
-----------------------------------------------------------------
--- DESTROY
-----------------------------------------------------------------
+function Signal:Pause() if not self._destroyed then self._paused = true end end
+function Signal:Resume() if not self._destroyed then self._paused = false end end
+function Signal:IsDestroyed(): boolean return self._destroyed or false end
+function Signal:IsPaused(): boolean return (not self._destroyed) and self._paused or false end
+function Signal:GetConnectionCount(): number return (not self._destroyed) and self._count or 0 end
 
 function Signal:Destroy()
 	if self._destroyed then return end
 	self._destroyed = true
 
-	if self._nativeConn then
-		self._nativeConn:Disconnect()
-		self._nativeConn = nil
-	end
+	if self._nativeConn then self._nativeConn:Disconnect(); self._nativeConn = nil end
 
 	local cur = self._head
 	while cur do
 		local next = cur._next
 		resetConnection(cur)
-		if #ConnectionPool < POOL_LIMIT then
-			table.insert(ConnectionPool, cur)
-		end
+		if poolSize < POOL_LIMIT then poolSize += 1; ConnectionPool[poolSize] = cur end
 		cur = next
 	end
 
-	if self._waiters then
-		for _, t in ipairs(self._waiters) do
-			task.spawn(t)
-		end
-	end
+	if self._waiters then for _, t in ipairs(self._waiters) do task.spawn(t) end end
 
 	self._head = nil
 	self._tail = nil
@@ -510,5 +383,4 @@ function Signal:Destroy()
 end
 
 ----------------------------------------------------------------
-
 return Signal
